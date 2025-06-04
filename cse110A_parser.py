@@ -1,7 +1,4 @@
-# change types to type ~ change IDtypes to IDtype
-import pdb
-import class_ast as class_ast
-from class_ast import *
+from cse110A_ast import *
 from typing import Callable,List,Tuple,Optional
 from scanner import Lexeme,Token,Scanner
 
@@ -90,16 +87,16 @@ class SymbolTable:
         # stack of hashtables
         self.ht_stack = [dict()]
 
-    def insert(self, ID: str, id_type: IDType, data_type: Type) -> None:
-        
-        # Create the data to store for the ID
-        
-        # HOMEWORK: make sure this is storing the
-        # right information! You may need to use
-        # the new name generator to make new names
-        # for some ids
-        info = SymbolTableData(id_type, data_type, ID)
+    def insert(self, ID: str, id_type: IDType, data_type: Type, nng : Optional[NewNameGenerator] = None) -> None:
+                
+        if id_type == IDType.VAR:
+            new_name = nng.mk_new_name()
+        else:
+            new_name = ID
+
+        info = SymbolTableData(id_type, data_type, new_name)  
         self.ht_stack[-1][ID] = info        
+
 
     # Lookup the symbol. If it is there, return the
     # info, otherwise return Noney
@@ -140,15 +137,25 @@ class Parser:
         self.nlg = NewLabelGenerator()
         self.nng = NewNameGenerator()
 
-        # needed to create the C++ wrapper
-        # You do not need to modify these for the
-        # homework
         self.function_name = None
         self.function_args = []
 
-    # HOMEWORK: top level function:
-    # This needs to return a list of 3 address instructions
-    def parse(self, s: str) -> List[str]:
+    # Do post order traversal of node and allocate vrs to every node in the tree
+    def allocate_vrs(self, node:ASTNode) -> None:
+        if is_leaf_node(node) and node.vr == None:
+            node.vr = self.vra.mk_new_vr()
+        elif is_binop_node(node):
+            self.allocate_vrs(node.l_child)
+            self.allocate_vrs(node.r_child)
+
+            node.vr = self.vra.mk_new_vr()
+        elif is_unop_node(node):
+            self.allocate_vrs(node.child)
+
+            node.vr = self.vra.mk_new_vr()
+
+
+    def parse(self, s: str, uf: int) -> List[str]:
 
         # Set the scanner and get the first token
         self.scanner.input_string(s)
@@ -244,12 +251,12 @@ class Parser:
         
     # The top level parsing function for your homework
     # This function needs to return a list of three address codes
-    def parse_statement_list(self) -> List[str]:
+    def parse_statement_list(self) -> List[str]:    
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.INT, Token.FLOAT, Token.ID, Token.IF, Token.LBRACE, Token.FOR]:
-            self.parse_statement()
-            self.parse_statement_list()
-            return []
+            a = self.parse_statement()
+            b = self.parse_statement_list()
+            return a + b
         if token_id in [Token.RBRACE]:
             return []
         
@@ -258,15 +265,15 @@ class Parser:
     def parse_statement(self) -> List[str]:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.INT, Token.FLOAT]:
-            self.parse_declaration_statement()
+            return self.parse_declaration_statement()
         elif token_id in [Token.ID]:
-            self.parse_assignment_statement()
+            return self.parse_assignment_statement()
         elif token_id in [Token.IF]:
-            self.parse_if_else_statement()
+            return self.parse_if_else_statement()
         elif token_id in [Token.LBRACE]:
-            self.parse_block_statement()
+            return self.parse_block_statement()
         elif token_id in [Token.FOR]:
-            self.parse_for_statement()
+            return self.parse_for_statement()
         else:
             raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
@@ -282,15 +289,20 @@ class Parser:
             # self.symbol_table.insert(...)
             self.eat(Token.ID)
             self.eat(Token.SEMI)
-            return
+            data_type = Type.INT
+            self.symbol_table.insert(id_name, IDType.VAR, data_type, self.nng)
+            return []
         if token_id in [Token.FLOAT]:
             self.eat(Token.FLOAT)
             id_name = self.to_match.value
             # Think about what you want to insert into the symbol table
             # self.symbol_table.insert(...)
             self.eat(Token.ID)
+
+            data_type = Type.FLOAT
+            self.symbol_table.insert(id_name, IDType.VAR, data_type, self.nng)
             self.eat(Token.SEMI)
-            return
+            return []
         
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
@@ -298,9 +310,9 @@ class Parser:
 
     # you need to return a list of three address instructions
     def parse_assignment_statement(self) -> List[str]:
-        self.parse_assignment_statement_base()
+        i = self.parse_assignment_statement_base()
         self.eat(Token.SEMI)
-        return
+        return i;
 
     # you need to return a list of three address instructions
     def parse_assignment_statement_base(self) -> List[str]:
@@ -310,57 +322,103 @@ class Parser:
             raise SymbolTableException(self.scanner.get_lineno(), id_name)
         self.eat(Token.ID)
         self.eat(Token.ASSIGN)
-        self.parse_expr()
-        return 
+        expr_ast = self.parse_expr()
+        type_inference(expr_ast)
+        if id_data.data_type == Type.INT and expr_ast.node_type == Type.FLOAT:
+            new_root = ASTFloatToIntNode(expr_ast)
+            new_root.node_type = Type.INT
+            expr_ast = new_root
+        elif id_data.data_type == Type.FLOAT and expr_ast.node_type == Type.INT:
+            new_root = ASTIntToFloatNode(expr_ast)
+            new_root.node_type = Type.FLOAT
+            expr_ast = new_root
+
+        self.allocate_vrs(expr_ast)
+        program = expr_ast.linearize_code()
+
+        if id_data.id_type == IDType.IO:
+            if id_data.data_type == Type.INT:
+                assignment_instruction = ["%s = vr2int(%s);" % (id_name, expr_ast.vr)]
+            else:
+                assignment_instruction = ["%s = vr2float(%s);" % (id_name, expr_ast.vr)]
+        else:
+            assignment_instruction = ["%s = %s;" % (id_data.new_name, expr_ast.vr)]
+        return program + assignment_instruction
 
     # you need to return a list of three address instructions
     def parse_if_else_statement(self) -> List[str]:
         self.eat(Token.IF)
         self.eat(Token.LPAR)
-        self.parse_expr()
+        expr_ast = self.parse_expr()
+        type_inference(expr_ast)
+        self.allocate_vrs(expr_ast)
+        expr_program = expr_ast.linearize_code()
+
+        else_label = self.nlg.mk_new_label()
+        end_label = self.nlg.mk_new_label()
+
+        zero_vr = self.vra.mk_new_vr() # VrX in the slides
+
+        compare_ins = ["%s = int2vr(0);" % (zero_vr), "beq(%s, %s, %s);" % (expr_ast.vr, zero_vr, else_label)]
+        branch_ins = ["branch(%s);" % (end_label)]
+
+
         self.eat(Token.RPAR)
-        self.parse_statement()
+        if_program = self.parse_statement()
         self.eat(Token.ELSE)
-        self.parse_statement()
-        return
+        else_program = self.parse_statement()
+        return expr_program + compare_ins + if_program + branch_ins + ["%s:" % (else_label)] + else_program + ["%s:" % (end_label)]
     
     # you need to return a list of three address instructions
     def parse_block_statement(self) -> List[str]:
         self.eat(Token.LBRACE)
         self.symbol_table.push_scope()
-        self.parse_statement_list()
+        ret = self.parse_statement_list()
         self.symbol_table.pop_scope()
         self.eat(Token.RBRACE)
-        return
+        return ret
 
     # you need to return a list of three address instructions
     def parse_for_statement(self) -> List[str]:
         self.eat(Token.FOR)
         self.eat(Token.LPAR)
-        self.parse_assignment_statement()
-        self.parse_expr()
+        original_assignment_program = self.parse_assignment_statement()
+        expr_ast = self.parse_expr()
+        type_inference(expr_ast)
+        self.allocate_vrs(expr_ast)
+        expr_program = expr_ast.linearize_code() 
+
         self.eat(Token.SEMI)
-        self.parse_assignment_statement_base()
+        loop_end_assignment_program = self.parse_assignment_statement_base()
         self.eat(Token.RPAR)
-        self.parse_statement()
-        return
+        loop_program = self.parse_statement()
+        
+        loop_start_label = self.nlg.mk_new_label()
+        end_label = self.nlg.mk_new_label()
+        zero_vr = self.vra.mk_new_vr()
+
+        compare_ins = ["%s = int2vr(0);" % (zero_vr), "beq(%s, %s, %s);" % (expr_ast.vr, zero_vr, end_label)]  # Branch out if expression == 0
+        branch_ins = ["branch(%s);" % (loop_start_label)]  # Instruction to branch back to the start of the loop (right before evaluating the expression again)
+
+        return original_assignment_program + ["%s:" % (loop_start_label)] + expr_program + compare_ins + loop_program + loop_end_assignment_program + branch_ins + ["%s:" % (end_label)]
 
     # you need to build and return an AST
-    def parse_expr(self) -> ASTNode:        
-        self.parse_comp()
-        self.parse_expr2()
-        return
+    def parse_expr(self) -> ASTNode:
+        node = self.parse_comp()
+        ret = self.parse_expr2(node)
+        return ret
 
     # you need to build and return an AST
-    def parse_expr2(self) -> ASTNode:
+    def parse_expr2(self, lhs_node: ASTNode) -> ASTNode:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.EQ]:
             self.eat(Token.EQ)
-            self.parse_comp()
-            self.parse_expr2()
-            return
+            rhs_node = self.parse_comp()
+            n = ASTEqNode(lhs_node, rhs_node)
+            return self.parse_expr2(n)
+        
         if token_id in [Token.SEMI, Token.RPAR]:
-            return 
+            return lhs_node
         
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
@@ -368,20 +426,20 @@ class Parser:
     
     # you need to build and return an AST
     def parse_comp(self) -> ASTNode:
-        self.parse_factor()
-        self.parse_comp2()
-        return
+        node = self.parse_factor()
+        ret = self.parse_comp2(node)
+        return ret
 
     # you need to build and return an AST
-    def parse_comp2(self) -> ASTNode:
+    def parse_comp2(self, lhs_node: ASTNode) -> ASTNode:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.LT]:
             self.eat(Token.LT)
-            self.parse_factor()
-            self.parse_comp2()
-            return
+            rhs_node = self.parse_factor()
+            ret = ASTLtNode(lhs_node, rhs_node)
+            return self.parse_comp2(ret)
         if token_id in [Token.SEMI, Token.RPAR, Token.EQ]:
-            return 
+            return lhs_node
         
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
@@ -389,25 +447,27 @@ class Parser:
 
     # you need to build and return an AST
     def parse_factor(self) -> ASTNode:
-        self.parse_term()
-        self.parse_factor2()
-        return
+        node = self.parse_term()
+        ret = self.parse_factor2(node)
+        return ret
 
     # you need to build and return an AST
-    def parse_factor2(self) -> ASTNode:
+    def parse_factor2(self, lhs_node:ASTNode) -> ASTNode:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.PLUS]:
             self.eat(Token.PLUS)
-            self.parse_term()            
-            self.parse_factor2()
-            return
+            rhs_node = self.parse_term()
+            ret = ASTPlusNode(lhs_node, rhs_node)    
+            ret = self.parse_factor2(ret)
+            return ret
         if token_id in [Token.MINUS]:
             self.eat(Token.MINUS)
-            self.parse_term()
-            self.parse_factor2()
-            return
+            rhs_node = self.parse_term()
+            ret = ASTMinusNode(lhs_node, rhs_node)    
+            ret = self.parse_factor2(ret)
+            return ret
         if token_id in [Token.EQ, Token.SEMI, Token.RPAR, Token.LT]:
-            return
+            return lhs_node
 
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
@@ -415,66 +475,131 @@ class Parser:
     
     # you need to build and return an AST
     def parse_term(self) -> ASTNode:
-        self.parse_unit()
-        self.parse_term2()
-        return
+        node = self.parse_unit()
+        ret = self.parse_term2(node)
+        return ret
 
     # you need to build and return an AST
-    def parse_term2(self) -> ASTNode:
+    def parse_term2(self, lhs_node:ASTNode) -> ASTNode:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.DIV]:
             self.eat(Token.DIV)
-            self.parse_unit()
-            self.parse_term2()
-            return 
-        if token_id in [Token.MUL]:
+            rhs_node = self.parse_unit()
+            ret = ASTDivNode(lhs_node, rhs_node)
+            ret = self.parse_term2(ret)
+            return ret
+        
+        if token_id in [Token.MUL]:            
             self.eat(Token.MUL)
-            self.parse_unit()
-            self.parse_term2()
-            return 
+            rhs_node = self.parse_unit()
+            ret = ASTMultNode(lhs_node, rhs_node)
+            ret = self.parse_term2(ret)
+            return ret
+        
         if token_id in [Token.EQ, Token.SEMI, Token.RPAR, Token.LT, Token.PLUS, Token.MINUS]:
-            return 
+            return lhs_node
 
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
                               [Token.EQ, Token.SEMI, Token.RPAR, Token.LT, Token.PLUS, Token.MINUS, Token.MUL, Token.DIV])
 
+
     # you need to build and return an AST
     def parse_unit(self) -> ASTNode:
         token_id = self.get_token_id(self.to_match)
         if token_id in [Token.NUM]:
+            value = self.to_match.value
+            node = ASTNumNode(value)
             self.eat(Token.NUM)            
-            return
+            return node
         if token_id in [Token.ID]:
             id_name = self.to_match.value
             id_data = self.symbol_table.lookup(id_name)
             if id_data == None:
                 raise SymbolTableException(self.scanner.get_lineno(), id_name)
             self.eat(Token.ID)
-            return
+
+            if (id_data.id_type == IDType.IO):
+                node = ASTIOIDNode(id_name, id_data.data_type)
+            # For Program Variable
+            else:
+                node = ASTVarIDNode(id_data.new_name, id_data.data_type)
+
+            return node
         if token_id in [Token.LPAR]:
             self.eat(Token.LPAR)
-            self.parse_expr()
+            ret = self.parse_expr()
             self.eat(Token.RPAR)
-            return
+            return ret
             
         raise ParserException(self.scanner.get_lineno(),
                               self.to_match,            
                               [Token.NUM, Token.ID, Token.LPAR])    
 
 # Type inference start
-
-# I suggest making functions like this to check
-# what class a node belongs to.
-def is_leaf_node(node) -> bool:
+def is_leaf_node(node: ASTNode) -> bool:
     return issubclass(type(node), ASTLeafNode)
 
+def is_binop_node(node: ASTNode) -> bool:
+    return issubclass(type(node), ASTBinOpNode)
+
+def is_unop_node(node: ASTNode) -> bool:
+    return issubclass(type(node), ASTUnOpNode)
+
+def convert_children_type(node: ASTNode) -> None:
+    if node.l_child.node_type == Type.INT and node.r_child.node_type == Type.FLOAT:
+        conv = ASTIntToFloatNode(node.l_child)
+        type_inference(conv)
+        node.l_child = conv
+    elif node.l_child.node_type == Type.FLOAT and node.r_child.node_type == Type.INT:
+        conv = ASTIntToFloatNode(node.r_child)
+        type_inference(conv)
+        node.r_child = conv
+
 # Type inference top level
-def type_inference(node) -> Type:
+def type_inference(node: ASTNode) -> Type:
     
     if is_leaf_node(node):
         return node.node_type
+
+    elif is_binop_node(node):
+        # do type inference on children
+        type_inference(node.l_child)
+        type_inference(node.r_child)
+
+        # do inference for arithmetic operators
+        if type(node) in [ASTPlusNode, ASTMinusNode, ASTMultNode, ASTDivNode]:
+            # if either child is float type, we become a float too.
+            if node.l_child.node_type == Type.FLOAT or node.r_child.node_type == Type.FLOAT:
+                node.node_type = Type.FLOAT
+            # otherwise, both children are int types. we become an int.
+            else:
+                node.node_type = Type.INT
+
+            convert_children_type(node)
+            
+        # types for Eq and Lt Nodes already set in ast.py
+        elif type(node) in [ASTEqNode, ASTLtNode]:
+            # node_type is always INT
+            node.node_type = Type.INT
+
+            # convert types of children
+            convert_children_type(node)
+
+    elif is_unop_node(node):
+        # do type inference on children
+        # type_inference(node.child) # NOTE: Should not be necessary. child node should definitely already have a type
+        
+        # Set our node_type and check child type
+        if type(node) in [ASTIntToFloatNode]:
+            node.node_type = Type.FLOAT
+
+            # Make sure chlid is right type
+            assert(node.child.node_type == Type.INT)
+            
+        elif type(node) in [ASTFloatToIntNode]:
+            node.node_type = Types.INT
+
+            # Make sure chlid is right type
+            assert(node.child.node_type == Type.FLOAT)
     
-    # next check if it is a unary op, then a bin op.
-    # remember that comparison operators (eq and lt)
-    # are handled a bit differently
